@@ -1,0 +1,376 @@
+"""
+Full analysis code for the temporal-grain recurrent neural-mass study
+- Implements delayed recurrent neural-mass dynamics
+- Euler (dt = ΔT) and RK2 (dt = ΔT/2) integrators
+- Soft clipping for x and dx/dt to avoid numerical overflow in pathological regimes
+- Computes markers: I_T (autocorr at lag T_int), D (90% PCA fraction), <P_tot> (mean metabolic power)
+- Runs 3 canonical conditions: Fine / Intermediate / Coarse
+- Repeats across seeds and reports mean ± SD
+
+Tested for: Python 3.11+, NumPy
+Optional: Matplotlib (only if you enable plotting)
+"""
+
+from __future__ import annotations
+import math
+import numpy as np
+from dataclasses import dataclass
+from typing import Dict, Tuple, List, Optional
+
+
+# -----------------------------
+# Parameters (match Methods)
+# -----------------------------
+@dataclass(frozen=True)
+class ModelParams:
+    N: int = 64
+    tau_m: float = 0.015
+    tau_d: float = 0.050
+    rho_target: float = 0.9
+    density: float = 0.20
+    sigma: float = 0.05
+    T_int: float = 0.200
+    cE: float = 1.0
+    cD: float = 0.2
+    x_clip: float = 10.0
+    dx_clip: float = 1000.0
+    total_time: float = 40.0
+    transient: float = 10.0
+
+
+# -----------------------------
+# Utilities
+# -----------------------------
+def set_seed(seed: int) -> np.random.Generator:
+    return np.random.default_rng(seed)
+
+
+def spectral_radius(W: np.ndarray) -> float:
+    # N=64, dense eigvals is fine
+    eigs = np.linalg.eigvals(W)
+    return float(np.max(np.abs(eigs)))
+
+
+def make_sparse_gaussian_W(
+    rng: np.random.Generator,
+    N: int,
+    density: float,
+    rho_target: float,
+    weight_scale: float = 1.0
+) -> np.ndarray:
+    mask = rng.random((N, N)) < density
+    W = rng.normal(0.0, 1.0, size=(N, N)) * mask.astype(float)
+    W *= weight_scale
+
+    rho = spectral_radius(W)
+    if rho == 0.0:
+        return W
+    W = W * (rho_target / rho)
+    return W
+
+
+def delayed_state_from_buffer(
+    buf: np.ndarray,
+    idx_now: int,
+    delay_steps_float: float
+) -> np.ndarray:
+    """
+    Linear interpolation for x(t - tau_d) using ring buffer.
+    buf: (L, N) ring buffer
+    idx_now: current write index (points to 'current' time state)
+    delay_steps_float: tau_d / dt
+    """
+    L = buf.shape[0]
+    k0 = int(math.floor(delay_steps_float))
+    frac = float(delay_steps_float - k0)
+
+    # We want state at t - delay. If idx_now holds x(t), then:
+    i0 = (idx_now - k0) % L
+    i1 = (idx_now - (k0 + 1)) % L
+
+    x0 = buf[i0]
+    x1 = buf[i1]
+    # frac=0 -> exactly k0 steps back; frac>0 -> interpolate toward (k0+1) steps back
+    return (1.0 - frac) * x0 + frac * x1
+
+
+def compute_autocorr_lag(
+    X: np.ndarray,
+    lag_steps: int
+) -> float:
+    """
+    Mean autocorrelation across units at fixed lag.
+    X: (T, N) time series (analysis window only)
+    """
+    T, N = X.shape
+    if lag_steps <= 0 or lag_steps >= T:
+        return float("nan")
+
+    A = X[:-lag_steps, :]
+    B = X[lag_steps:, :]
+
+    cors = []
+    for i in range(N):
+        a = A[:, i]
+        b = B[:, i]
+        sa = np.std(a)
+        sb = np.std(b)
+        if sa == 0.0 or sb == 0.0:
+            continue
+        c = np.corrcoef(a, b)[0, 1]
+        if np.isfinite(c):
+            cors.append(c)
+
+    if len(cors) == 0:
+        return float("nan")
+    return float(np.mean(cors))
+
+
+def compute_dimensionality_90(
+    X: np.ndarray
+) -> float:
+    """
+    Effective dimensionality D = k/N where k components explain 90% variance.
+    Uses eigenvalues of covariance (no sklearn dependency).
+    """
+    T, N = X.shape
+    if T < 2:
+        return float("nan")
+
+    Xc = X - np.mean(X, axis=0, keepdims=True)
+    # If all-zero variance, undefined
+    var_total = float(np.sum(np.var(Xc, axis=0)))
+    if var_total == 0.0 or not np.isfinite(var_total):
+        return float("nan")
+
+    # Covariance
+    C = (Xc.T @ Xc) / (T - 1)
+    # Symmetric eig
+    evals = np.linalg.eigvalsh(C)
+    evals = np.maximum(evals, 0.0)
+    s = float(np.sum(evals))
+    if s == 0.0 or not np.isfinite(s):
+        return float("nan")
+
+    evals_sorted = evals[::-1]
+    cum = np.cumsum(evals_sorted) / s
+    k = int(np.searchsorted(cum, 0.90) + 1)
+    return float(k / N)
+
+
+# -----------------------------
+# Dynamics
+# -----------------------------
+def rhs(
+    x: np.ndarray,
+    x_delay: np.ndarray,
+    W: np.ndarray,
+    rng: np.random.Generator,
+    params: ModelParams
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Returns (dxdt_clipped, dxdt_raw_for_cost) after applying noise and tanh.
+    Noise is additive in the state equation (as in Methods).
+    """
+    # deterministic part
+    rec = W @ np.tanh(x_delay)
+    noise = rng.normal(0.0, params.sigma, size=x.shape)
+    dxdt = (-x + rec + noise) / params.tau_m
+
+    # soft clipping for stability in pathological regimes
+    dxdt_clipped = np.clip(dxdt, -params.dx_clip, params.dx_clip)
+    return dxdt_clipped, dxdt
+
+
+def simulate(
+    DeltaT: float,
+    method: str,
+    seed: int,
+    params: ModelParams,
+    W: Optional[np.ndarray] = None
+) -> Dict[str, object]:
+    """
+    Simulate one run for one ΔT and one integrator.
+    method: "euler" or "rk2"
+    """
+    rng = set_seed(seed)
+
+    if W is None:
+        W = make_sparse_gaussian_W(
+            rng=rng,
+            N=params.N,
+            density=params.density,
+            rho_target=params.rho_target
+        )
+
+    if method.lower() == "euler":
+        dt = DeltaT
+        substeps = 1
+    elif method.lower() == "rk2":
+        dt = DeltaT / 2.0
+        substeps = 2
+    else:
+        raise ValueError("method must be 'euler' or 'rk2'")
+
+    steps_total = int(round(params.total_time / dt))
+    steps_trans = int(round(params.transient / dt))
+    steps_keep = steps_total - steps_trans
+    if steps_keep <= 10:
+        raise ValueError("analysis window too short; increase total_time or reduce transient")
+
+    # Delay buffer length: enough to cover tau_d plus 2 steps for interpolation safety
+    delay_steps_float = params.tau_d / dt
+    L = int(math.ceil(delay_steps_float)) + 3
+
+    # Initialize state
+    x = rng.normal(0.0, 0.1, size=(params.N,))
+    x = np.clip(x, -params.x_clip, params.x_clip)
+
+    # ring buffer stores past states; initialize with x
+    buf = np.tile(x[None, :], (L, 1))
+    idx = 0  # current index corresponds to "current" x
+
+    # storage (analysis window only)
+    X_keep = np.zeros((steps_keep, params.N), dtype=float)
+
+    # metabolic power time series (analysis window only)
+    P_keep = np.zeros((steps_keep,), dtype=float)
+
+    keep_i = 0
+
+    for tstep in range(steps_total):
+        # Update by one dt step (Euler) or 2 substeps for RK2 (each substep uses its own delay computed at that dt)
+        if method.lower() == "euler":
+            x_delay = delayed_state_from_buffer(buf, idx, delay_steps_float)
+            dx1, dxraw = rhs(x, x_delay, W, rng, params)
+
+            x_new = x + dt * dx1
+            x_new = np.clip(x_new, -params.x_clip, params.x_clip)
+
+            # cost uses clipped dx/dt as in Methods clipping policy
+            p_i = params.cE * np.abs(x_new) + params.cD * np.abs(dx1)
+            P = float(np.mean(p_i))
+
+            x = x_new
+
+            # write to ring buffer
+            idx = (idx + 1) % L
+            buf[idx] = x
+
+        else:
+            # RK2: two half-steps. We treat dt=ΔT/2 as integration step.
+            # Each substep recomputes delayed state consistent with dt.
+            # Use standard midpoint RK2.
+            x_delay = delayed_state_from_buffer(buf, idx, delay_steps_float)
+            k1, _ = rhs(x, x_delay, W, rng, params)
+
+            x_mid = x + 0.5 * dt * k1
+            x_mid = np.clip(x_mid, -params.x_clip, params.x_clip)
+
+            # For the midpoint evaluation, we approximate delay with current buffer too.
+            # This is consistent with explicit RK on a DDE with sampled delay state.
+            x_delay2 = delayed_state_from_buffer(buf, idx, delay_steps_float)
+            k2, _ = rhs(x_mid, x_delay2, W, rng, params)
+
+            x_new = x + dt * k2
+            x_new = np.clip(x_new, -params.x_clip, params.x_clip)
+
+            p_i = params.cE * np.abs(x_new) + params.cD * np.abs(k2)
+            P = float(np.mean(p_i))
+
+            x = x_new
+
+            idx = (idx + 1) % L
+            buf[idx] = x
+
+        # store after transient
+        if tstep >= steps_trans:
+            X_keep[keep_i, :] = x
+            P_keep[keep_i] = P
+            keep_i += 1
+
+    # markers
+    lag_steps = int(round(params.T_int / dt))
+    IT = compute_autocorr_lag(X_keep, lag_steps)
+    D = compute_dimensionality_90(X_keep)
+    Pmean = float(np.mean(P_keep))
+
+    return {
+        "DeltaT": DeltaT,
+        "dt": dt,
+        "method": method.lower(),
+        "seed": seed,
+        "W": W,
+        "X": X_keep,
+        "P_series": P_keep,
+        "I_T": IT,
+        "D": D,
+        "P_mean": Pmean,
+        "lag_steps": lag_steps
+    }
+
+
+# -----------------------------
+# Batch runner (3 conditions + Euler/RK2)
+# -----------------------------
+def summarize_across_seeds(
+    results: List[Dict[str, object]]
+) -> Dict[str, float]:
+    ITs = np.array([r["I_T"] for r in results], dtype=float)
+    Ds  = np.array([r["D"] for r in results], dtype=float)
+    Ps  = np.array([r["P_mean"] for r in results], dtype=float)
+
+    return {
+        "I_T_mean": float(np.nanmean(ITs)),
+        "I_T_sd":   float(np.nanstd(ITs, ddof=1)) if np.sum(np.isfinite(ITs)) >= 2 else float("nan"),
+        "D_mean":   float(np.nanmean(Ds)),
+        "D_sd":     float(np.nanstd(Ds, ddof=1)) if np.sum(np.isfinite(Ds)) >= 2 else float("nan"),
+        "P_mean":   float(np.nanmean(Ps)),
+        "P_sd":     float(np.nanstd(Ps, ddof=1)) if np.sum(np.isfinite(Ps)) >= 2 else float("nan"),
+    }
+
+
+def run_all(
+    params: ModelParams,
+    seeds: List[int] = [0, 1, 2, 3, 4]
+) -> None:
+    conditions = [
+        ("Fine", 0.002),
+        ("Intermediate", 0.060),
+        ("Coarse", 0.200),
+    ]
+
+    for name, dT in conditions:
+        G = dT / params.T_int
+        print(f"\nCondition: {name}  (ΔT={dT:.3f}, G={G:.2f})")
+
+        # Euler
+        res_e = []
+        for s in seeds:
+            # new W per seed as in Methods
+            res = simulate(DeltaT=dT, method="euler", seed=s, params=params, W=None)
+            res_e.append(res)
+        sum_e = summarize_across_seeds(res_e)
+        print("  Euler(dt=ΔT)")
+        print(f"    I_T      = {sum_e['I_T_mean']:.4f} ± {sum_e['I_T_sd']:.4f}")
+        print(f"    D        = {sum_e['D_mean']:.4f} ± {sum_e['D_sd']:.4f}")
+        print(f"    <P_tot>  = {sum_e['P_mean']:.4f} ± {sum_e['P_sd']:.4f}")
+
+        # RK2
+        res_r = []
+        for s in seeds:
+            res = simulate(DeltaT=dT, method="rk2", seed=s, params=params, W=None)
+            res_r.append(res)
+        sum_r = summarize_across_seeds(res_r)
+        print("  RK2(dt=ΔT/2)")
+        print(f"    I_T      = {sum_r['I_T_mean']:.4f} ± {sum_r['I_T_sd']:.4f}")
+        print(f"    D        = {sum_r['D_mean']:.4f} ± {sum_r['D_sd']:.4f}")
+        print(f"    <P_tot>  = {sum_r['P_mean']:.4f} ± {sum_r['P_sd']:.4f}")
+
+
+# -----------------------------
+# Entry point
+# -----------------------------
+if __name__ == "__main__":
+    params = ModelParams()
+    run_all(params=params, seeds=[0, 1, 2, 3, 4])
